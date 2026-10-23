@@ -1,0 +1,80 @@
+# Streamlit (frontend) → FastAPI (backend) → MLflow (tracking server + model registry)
+#
+#   docker compose up --build
+#
+# Start order: mlflow (healthy) → trainer (registers the champion, then exits) → backend (healthy) → frontend.
+#
+# Ports (same number inside and outside the containers):
+#   Streamlit 8501 · FastAPI 8000 · MLflow 5001 (not 5000: macOS AirPlay Receiver uses it)
+# If one is already taken on your machine, change the host side in .env (FRONTEND_PORT, API_PORT, MLFLOW_PORT).
+# Inside the network, services reach each other by name (http://mlflow:5001, http://backend:8000), not localhost.
+
+name: streamlit-fastapi-mlflow
+
+services:
+  mlflow:
+    build: ./mlflow
+    volumes:
+      - mlflow-data:/mlflow          # runs, registry and model files survive restarts
+    ports:
+      - "${MLFLOW_PORT:-5001}:5001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - appnet
+
+  trainer:
+    build: ./trainer
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+      MODEL_NAME: ${MODEL_NAME:-iris-classifier}
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    restart: "no"                    # one-off job: train, register, set alias, exit
+    networks:
+      - appnet
+
+  backend:
+    build: ./backend
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5001
+      MODEL_NAME: ${MODEL_NAME:-iris-classifier}
+      MODEL_ALIAS: champion
+    depends_on:
+      trainer:
+        condition: service_completed_successfully
+    ports:
+      - "${API_PORT:-8000}:8000"
+    networks:
+      - appnet
+
+  frontend:
+    build: ./frontend
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      BACKEND_URL: http://backend:8000                          # container → container
+      PUBLIC_API_URL: http://localhost:${API_PORT:-8000}        # links for your browser
+      MLFLOW_UI_URL: http://localhost:${MLFLOW_PORT:-5001}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-8501}:8501"
+    networks:
+      - appnet
+
+volumes:
+  mlflow-data:
+
+networks:
+  appnet:
+    driver: bridge
